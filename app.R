@@ -32,7 +32,7 @@ headerUI <- function() {
   titlePanel(
     div(
       class = "header",
-      tags$h1("KKU-BiblioMerge V.2.0 ---24122024---", class = "title"),
+      tags$h1("KKU-BiblioMerge V.3.0 ---28032025---", class = "title"),
       tags$p("Bibliometric Data Integration and Analysis Tool", class = "subtitle")
     )
   )
@@ -68,7 +68,7 @@ trackFileProcessing <- function(file_path, dbsource) {
     data = NULL,
     metrics = list()
   )
-
+  
   
   # Custom WoS/ISI parser implementation
   parseWoS <- function(filepath) {
@@ -265,7 +265,7 @@ trackAnalysis <- function(combined_data) {
     result$error <- e$message
   })
   
-
+  
   return(result)
 }
 
@@ -425,8 +425,8 @@ mainPanelUI <- function() {
                         DTOutput("mappingTable"))
                )),
       tabPanel("System Performance",
-        h3("System Performance Metrics"),
-        verbatimTextOutput("performanceMetrics")
+               h3("System Performance Metrics"),
+               verbatimTextOutput("performanceMetrics")
       )
     )
   )
@@ -512,7 +512,7 @@ server <- function(input, output, session) {
       })
     })
   }
-
+  
   # Add these metric calculation functions to your script
   calculateMetrics <- function(data) {
     if (is.null(data)) return(NULL)
@@ -659,88 +659,56 @@ server <- function(input, output, session) {
   observeEvent(input$wosFile, {
     req(input$wosFile)
     
-    # Start timing
-    tic("wos_processing")
-    
-    tryCatch({
-      # Record start time and file size
-      start_time <- Sys.time()
-      file_size <- file.info(input$wosFile$datapath)$size / (1024 * 1024) # Size in MB
-      
-      # Create a connection to read the file in chunks
-      con <- file(input$wosFile$datapath, "r")
-      chunk_size <- 1024 * 1024 # 1MB chunks
-      
-      # Initialize empty list to store chunks
-      chunks <- list()
-      chunk_counter <- 1
-      
-      # Process file in chunks
-      while (TRUE) {
-        # Read chunk
-        chunk <- readLines(con, n = chunk_size)
+    withProgress(message = 'Processing WoS file with enhanced error handling...', value = 0, {
+      tryCatch({
+        # Read raw text and preprocess
+        raw_text <- readLines(input$wosFile$datapath, warn = FALSE)
+        if (length(raw_text) == 0) stop("WoS file is empty or unreadable.")
         
-        if (length(chunk) == 0) break  # End of file
+        # Split records based on "PT "
+        record_indices <- grep("^PT ", raw_text)
+        records <- lapply(seq_along(record_indices), function(i) {
+          start <- record_indices[i]
+          end <- if (i < length(record_indices)) record_indices[i + 1] - 1 else length(raw_text)
+          raw_text[start:end]
+        })
         
-        # Process chunk
-        chunk_df <- tryCatch({
-          convert2df(textConnection(chunk),
-                     dbsource = "isi",
-                     format = "plaintext")
-        }, error = function(e) NULL)
+        # Required WoS tags
+        required_tags <- c("PT", "AU", "TI", "DE", "C1", "RP", "CR")
         
-        if (!is.null(chunk_df)) {
-          chunks[[chunk_counter]] <- chunk_df
-          chunk_counter <- chunk_counter + 1
-        }
+        # Clean and ensure all fields
+        clean_records <- lapply(records, function(rec) {
+          tags_present <- gsub(" .*", "", rec)
+          for (tag in required_tags) {
+            if (!(tag %in% tags_present)) {
+              rec <- c(rec, paste0(tag, " NA"))
+            }
+          }
+          rec
+        })
         
-        # Garbage collection to free memory
-        gc()
-      }
-      
-      # Close connection
-      close(con)
-      
-      # Combine all chunks efficiently
-      rv$wos_data <- do.call(rbind, chunks)
-      
-      # Clear chunks to free memory
-      rm(chunks)
-      gc()
-      
-      # Record performance metrics
-      end_time <- Sys.time()
-      processing_time <- as.numeric(difftime(end_time, start_time, units = "secs"))
-      
-      rv$performance$file_processing$wos <- list(
-        file_size_mb = file_size,
-        processing_time_sec = processing_time,
-        records = nrow(rv$wos_data),
-        records_per_second = nrow(rv$wos_data) / processing_time
-      )
-      
-      # Update status with file size info
-      output$statusOutput <- renderUI({
-        HTML(sprintf(
-          "<div style='color: green;'>WoS file (%.1f MB) processed successfully!</div>",
-          file_size
-        ))
+        # Flatten cleaned records and save temporarily
+        flat_content <- unlist(lapply(clean_records, paste, collapse = "\n"))
+        temp_file <- tempfile(fileext = ".txt")
+        writeLines(flat_content, temp_file)
+        
+        # Convert using bibliometrix
+        wos_df <- convert2df(temp_file, dbsource = "wos", format = "plaintext")
+        
+        # Update reactive
+        rv$wos_data <- wos_df
+        output$statusOutput <- renderUI({
+          HTML(paste0("<div style='color: green;'>WoS file processed successfully with ", nrow(wos_df), " records</div>"))
+        })
+        
+      }, error = function(e) {
+        output$statusOutput <- renderUI({
+          HTML(paste0("<div style='color: red;'>Error processing WoS file: ", e$message, "</div>"))
+        })
       })
-      
-    }, error = function(e) {
-      output$statusOutput <- renderUI({
-        HTML(paste("<div style='color: red;'>Error processing WoS file:", e$message, "</div>"))
-      })
-    }, finally = {
-      # Ensure connection is closed even if there's an error
-      if (exists("con") && isOpen(con)) {
-        close(con)
-      }
     })
-    
-    # Stop timing
-    toc(log = TRUE, quiet = TRUE)
   })
+  
   
   # Track data processing and merging
   observeEvent(input$processButton, {
@@ -856,6 +824,19 @@ server <- function(input, output, session) {
       } else if (is.null(rv$wos_data)) {
         rv$combined_data <- rv$scopus_data
       } else {
+        fill_missing_fields <- function(df) {
+          for (field in c("DE", "C1", "RP", "CR")) {
+            if (!(field %in% names(df))) {
+              df[[field]] <- rep("", nrow(df))
+            }
+          }
+          return(df)
+        }
+        
+        # In your merging logic before mergeDbSources
+        rv$scopus_data <- fill_missing_fields(rv$scopus_data)
+        rv$wos_data <- fill_missing_fields(rv$wos_data)
+        
         rv$combined_data <- mergeDbSources(rv$wos_data, rv$scopus_data, 
                                            remove.duplicated = TRUE)
       }
@@ -954,7 +935,7 @@ server <- function(input, output, session) {
       write.xlsx(rv$combined_data, file)
     }
   )
-
+  
   
   
   
